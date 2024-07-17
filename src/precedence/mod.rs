@@ -2,6 +2,7 @@
 //! precedence-based expression parsing (namely [Pratt Parsing](`pratt`) and
 //! the [Shunting-Yard Algorithm](`shunting_yard`))
 
+pub mod pratt;
 pub mod shunting_yard;
 
 
