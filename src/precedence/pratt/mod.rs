@@ -152,50 +152,58 @@ where
   F: FnMut(I, OperatorCall<Op1, Op2, Op3, O>) -> IResult<I, O, E>,
 {
   move |i: I| {
-    let (mut i, mut lhs) = if let Ok(r) = operand.borrow_mut().parse(i.clone()) {
-      r
-    } else {
-      let (
-        i,
-        UnaryDef {
-          value: op,
-          binding_power: r_bp,
-        },
-      ) = prefix.borrow_mut().parse(i)?;
-      let (i, rhs) = pratt::<_, _, _, _, _, _, _, P, P1, P2, P3, F>(
-        operand.borrow_mut(),
-        infix.borrow_mut(),
-        prefix.borrow_mut(),
-        postfix.borrow_mut(),
-        fold.borrow_mut(),
-        r_bp,
-      )
-      .parse(i)?;
-      fold.borrow_mut()(i, OperatorCall::Prefix(op, rhs))?
+    let (mut i, mut lhs) = match operand.borrow_mut().parse(i.clone()) {
+      Err(e @ crate::Err::Failure(_)) => {return Err(e);}
+      Ok(r) => r,
+      Err(_) => {
+        let (
+          i,
+          UnaryDef {
+            value: op,
+            binding_power: r_bp,
+          },
+        ) = prefix.borrow_mut().parse(i)?;
+        let (i, rhs) = pratt::<_, _, _, _, _, _, _, P, P1, P2, P3, F>(
+          operand.borrow_mut(),
+          infix.borrow_mut(),
+          prefix.borrow_mut(),
+          postfix.borrow_mut(),
+          fold.borrow_mut(),
+          r_bp,
+        )
+        .parse(i)?;
+        fold.borrow_mut()(i, OperatorCall::Prefix(op, rhs))?
+      },
     };
 
     loop {
-      if let Ok((
-        new_i,
-        UnaryDef {
-          value: op,
-          binding_power: l_bp,
-        },
-      )) = postfix.borrow_mut().parse(i.clone())
-      {
-        if l_bp < min_bp {
-          break;
-        }
-
-        (i, lhs) = fold.borrow_mut()(new_i, OperatorCall::Postfix(lhs, op))?;
-      } else if let Ok((
-        new_i,
-        BinaryDef {
-          value: op,
-          binding_power: (l_bp, r_bp),
-        },
-      )) = infix.borrow_mut().parse(i.clone())
-      {
+      match postfix.borrow_mut().parse(i.clone()) {
+        Err(e @ crate::Err::Failure(_)) => {return Err(e);}
+        Err(_) => (),
+        Ok((
+          new_i,
+          UnaryDef {
+            value: op,
+            binding_power: l_bp,
+          },)) => {
+            if l_bp < min_bp {
+              break;
+            }
+    
+            (i, lhs) = fold.borrow_mut()(new_i, OperatorCall::Postfix(lhs, op))?;
+            continue;
+          }
+      }
+      match infix.borrow_mut().parse(i.clone()) {
+        Err(e @ crate::Err::Failure(_)) => {return Err(e);}
+        Err(_) => (),
+        Ok((
+          new_i,
+          BinaryDef {
+            value: op,
+            binding_power: (l_bp, r_bp),
+          },
+        )) => {
         if l_bp < min_bp {
           break;
         }
@@ -213,9 +221,9 @@ where
         .parse(i)?;
 
         (i, lhs) = fold.borrow_mut()(i, OperatorCall::Infix(lhs, op, rhs))?;
-      } else {
-        break;
-      }
+        continue;
+      }}
+      break;
     }
 
     Ok((i, lhs))
