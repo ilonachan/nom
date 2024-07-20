@@ -17,7 +17,7 @@ use std::borrow::BorrowMut;
 use crate::combinator::map;
 use crate::error::{ErrorKind, FromExternalError, ParseError};
 use crate::lib::std::vec::Vec;
-use crate::{Err, Parser};
+use crate::{Err, IResult, Parser};
 
 use super::{Assoc, OperatorCall};
 
@@ -220,152 +220,139 @@ where
   P3: Parser<I, Output = UnaryDef<Op3, Q>, Error = E>,
   F: FnMut(OperatorCall<Op1, Op2, Op3, O>) -> Result<O, E2>,
 {
+  let mut prefix = (move |i: I| prefix.borrow_mut().parse(i)).map(OperatorDef::Prefix);
+  let mut infix = (move |i: I| infix.borrow_mut().parse(i)).map(OperatorDef::Infix);
+  let mut postfix = (move |i: I| postfix.borrow_mut().parse(i)).map(OperatorDef::Postfix);
+
   move |mut i: I| {
     let mut operands = Vec::new();
     let mut operators = Vec::new();
     let mut i1 = i.clone();
 
-    'main: loop {
-      'prefix: loop {
-        match prefix.borrow_mut().parse(i1.clone()) {
-          Err(Err::Error(_)) => break 'prefix,
-          Err(e) => return Err(e),
-          Ok((i2, o)) => {
-            // infinite loop check: the parser must always consume
-            if i2 == i1 {
-              return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Precedence)));
-            }
-            i1 = i2;
-            operators.push(OperatorDef::Prefix(o));
+    let pop_operator =
+      |start_i: I, cur_i: I, operands: &mut Vec<O>, operators: &mut Vec<_>, fold: &mut F| {
+        let value = match operands.pop() {
+          Some(o) => o,
+          None => {
+            return Err(Err::Error(E::from_error_kind(
+              start_i,
+              ErrorKind::Precedence,
+            )))
           }
+        };
+        let operation = match operators.pop().unwrap() {
+          OperatorDef::Prefix(UnaryDef { value: op, .. }) => OperatorCall::Prefix(op, value),
+          OperatorDef::Postfix(UnaryDef { value: op, .. }) => OperatorCall::Postfix(value, op),
+          OperatorDef::Infix(BinaryDef { value: op, .. }) => match operands.pop() {
+            Some(lhs) => OperatorCall::Infix(lhs, op, value),
+            None => return Err(Err::Error(E::from_error_kind(cur_i, ErrorKind::Precedence))),
+          },
+        };
+        let result = match fold.borrow_mut()(operation) {
+          Err(e) => {
+            return Err(Err::Error(E::from_external_error(
+              start_i,
+              ErrorKind::Precedence,
+              e,
+            )))
+          }
+          Ok(r) => r,
+        };
+        operands.push(result);
+        Ok(())
+      };
+
+    let process_new_operator = |new_res: IResult<I, OperatorDef<_, _, _, _>, _>,
+                                start_i: I,
+                                cur_i: &mut I,
+                                operands: &mut Vec<O>,
+                                operators: &mut Vec<_>,
+                                fold: &mut F|
+     -> Result<bool, Err<E>> {
+      match new_res {
+        Err(Err::Error(_)) => Ok(false),
+        Err(e) => Err(e),
+        Ok((new_i, new_operator)) => {
+          // infinite loop check: the parser must always consume
+          if &new_i == cur_i {
+            return Err(Err::Error(E::from_error_kind(
+              cur_i.clone(),
+              ErrorKind::Precedence,
+            )));
+          }
+          // do the popping
+          while operators
+            .last()
+            .map(|op: &OperatorDef<_, _, _, _>| match &new_operator {
+              OperatorDef::Prefix(_) => false,
+              OperatorDef::Postfix(o) => op.precedence() <= o.precedence,
+              OperatorDef::Infix(o) => {
+                op.precedence() < o.precedence
+                  || (o.assoc == Assoc::Left && op.precedence() == o.precedence)
+                  || matches!(op, OperatorDef::Postfix(_))
+              }
+            })
+            .unwrap_or(false)
+          {
+            pop_operator(start_i.clone(), cur_i.clone(), operands, operators, fold)?;
+          }
+          operators.push(new_operator);
+          *cur_i = new_i;
+          Ok(true)
         }
       }
+    };
+
+    'main: loop {
+      while process_new_operator(
+        prefix.parse(i1.clone()),
+        i.clone(),
+        &mut i1,
+        &mut operands,
+        &mut operators,
+        fold.borrow_mut(),
+      )? {}
 
       let (i2, o) = match operand.borrow_mut().parse(i1.clone()) {
         Ok((i, o)) => (i, o),
         Err(Err::Error(e)) => return Err(Err::Error(E::append(i, ErrorKind::Precedence, e))),
         Err(e) => return Err(e),
       };
-      i1 = i2;
       operands.push(o);
+      i1 = i2;
 
-      'postfix: loop {
-        match postfix.borrow_mut().parse(i1.clone()) {
-          Err(Err::Error(_)) => break 'postfix,
-          Err(e) => return Err(e),
-          Ok((i2, o)) => {
-            // infinite loop check: the parser must always consume
-            if i2 == i1 {
-              return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Precedence)));
-            }
+      while process_new_operator(
+        postfix.parse(i1.clone()),
+        i.clone(),
+        &mut i1,
+        &mut operands,
+        &mut operators,
+        fold.borrow_mut(),
+      )? {}
 
-            while operators
-              .last()
-              .map(|op| op.precedence() <= o.precedence)
-              .unwrap_or(false)
-            {
-              let value = operands.pop().unwrap();
-              let operation = match operators.pop().unwrap() {
-                OperatorDef::Prefix(UnaryDef { value: op, .. }) => OperatorCall::Prefix(op, value),
-                OperatorDef::Postfix(UnaryDef { value: op, .. }) => {
-                  OperatorCall::Postfix(value, op)
-                }
-                OperatorDef::Infix(BinaryDef { value: op, .. }) => match operands.pop() {
-                  Some(lhs) => OperatorCall::Infix(lhs, op, value),
-                  None => return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Precedence))),
-                },
-              };
-              let result = match fold.borrow_mut()(operation) {
-                Err(e) => {
-                  return Err(Err::Error(E::from_external_error(
-                    i,
-                    ErrorKind::Precedence,
-                    e,
-                  )))
-                }
-                Ok(r) => r,
-              };
-              operands.push(result);
-            }
-            i1 = i2;
-            operators.push(OperatorDef::Postfix(o));
-          }
-        }
+      if !process_new_operator(
+        infix.parse(i1.clone()),
+        i.clone(),
+        &mut i1,
+        &mut operands,
+        &mut operators,
+        fold.borrow_mut(),
+      )? {
+        break 'main;
       }
 
-      match infix.borrow_mut().parse(i1.clone()) {
-        Err(Err::Error(_)) => break 'main,
-        Err(e) => return Err(e),
-        Ok((i2, o)) => {
-          while operators
-            .last()
-            .map(|op| {
-              op.precedence() < o.precedence
-                || (o.assoc == Assoc::Left && op.precedence() == o.precedence)
-                || ({
-                  let this = &op;
-                  matches!(this, OperatorDef::Postfix(_))
-                })
-            })
-            .unwrap_or(false)
-          {
-            let value = operands.pop().unwrap();
-            let operation = match operators.pop().unwrap() {
-              OperatorDef::Prefix(UnaryDef { value: op, .. }) => OperatorCall::Prefix(op, value),
-              OperatorDef::Postfix(UnaryDef { value: op, .. }) => OperatorCall::Postfix(value, op),
-              OperatorDef::Infix(BinaryDef { value: op, .. }) => match operands.pop() {
-                Some(lhs) => OperatorCall::Infix(lhs, op, value),
-                None => return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Precedence))),
-              },
-            };
-            let result = match fold.borrow_mut()(operation) {
-              Err(e) => {
-                return Err(Err::Error(E::from_external_error(
-                  i,
-                  ErrorKind::Precedence,
-                  e,
-                )))
-              }
-              Ok(r) => r,
-            };
-            operands.push(result);
-          }
-          operators.push(OperatorDef::Infix(o));
-          i1 = i2;
-        }
-      }
-
-      // infinite loop check: either operand or operator must consume input
-      if i == i1 {
-        return Err(Err::Error(E::from_error_kind(i, ErrorKind::Precedence)));
-      }
       i = i1.clone();
     }
 
+    // process remaining operators
     while !operators.is_empty() {
-      let value = match operands.pop() {
-        Some(o) => o,
-        None => return Err(Err::Error(E::from_error_kind(i, ErrorKind::Precedence))),
-      };
-      let operation = match operators.pop().unwrap() {
-        OperatorDef::Prefix(UnaryDef { value: op, .. }) => OperatorCall::Prefix(op, value),
-        OperatorDef::Postfix(UnaryDef { value: op, .. }) => OperatorCall::Postfix(value, op),
-        OperatorDef::Infix(BinaryDef { value: op, .. }) => match operands.pop() {
-          Some(lhs) => OperatorCall::Infix(lhs, op, value),
-          None => return Err(Err::Error(E::from_error_kind(i, ErrorKind::Precedence))),
-        },
-      };
-      let result = match fold.borrow_mut()(operation) {
-        Ok(r) => r,
-        Err(e) => {
-          return Err(Err::Error(E::from_external_error(
-            i,
-            ErrorKind::Precedence,
-            e,
-          )))
-        }
-      };
-      operands.push(result);
+      pop_operator(
+        i.clone(),
+        i.clone(),
+        &mut operands,
+        &mut operators,
+        fold.borrow_mut(),
+      )?;
     }
 
     if operands.len() == 1 {
